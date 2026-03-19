@@ -667,8 +667,22 @@ class Main(star.Star):
 
         if send_audio:
             if audio_url:
-                await event.send(MessageChain([Record(file=audio_url)]))
-                sent_anything = True
+                try:
+                    await event.send(MessageChain([Record(url=audio_url)]))
+                    sent_anything = True
+                except Exception as e:
+                    logger.error(f"Netease Music plugin: Failed to send audio record for {audio_url}. Error: {e!s}")
+                    await event.send(
+                        MessageChain(
+                            [
+                                Plain(
+                                    "喵~ 语音消息发送超时了，当前适配器可能不太兼容远程音频。\n"
+                                    f"主人可以先点这里听：{audio_url}"
+                                )
+                            ]
+                        )
+                    )
+                    sent_anything = True
             elif audio_notice:
                 await event.send(MessageChain([Plain(audio_notice)]))
                 sent_anything = True
