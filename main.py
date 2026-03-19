@@ -2,21 +2,74 @@
 Netease Music Enhanced Plugin for AstrBot
 - Author: NachoCrazy
 - Repo: https://github.com/NachoCrazy/netease-music-astrbot-plugin
-- Features: Interactive song selection, cover display, audio playback, and /song/url/match support.
+- Features: Interactive song selection, configurable song messages, lyric image rendering, and /song/url/match playback.
 """
 
 import re
 import time
+import io
 import base64
 import aiohttp
 import asyncio
 import urllib.parse
-from typing import Dict, Any, Optional, List
+from pathlib import Path
+from typing import Dict, Any, Optional, List, Tuple
 
 from astrbot.api import star, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.api.message_components import Plain, Image, Record
+
+try:
+    from PIL import Image as PILImage
+    from PIL import ImageDraw, ImageFont
+except ImportError:  # pragma: no cover - runtime dependency check
+    PILImage = None
+    ImageDraw = None
+    ImageFont = None
+
+
+LYRIC_IMAGE_WIDTH = 1125
+LYRIC_IMAGE_MAX_HEIGHT = 16000
+LYRIC_FONT_PATH = Path(__file__).resolve().parent / "assets" / "fonts" / "NotoSansSC-Regular.otf"
+LYRIC_METADATA_PREFIXES = (
+    "作词",
+    "作曲",
+    "编曲",
+    "制作人",
+    "监制",
+    "混音",
+    "母带",
+    "和声",
+    "录音",
+    "配唱",
+    "录音室",
+    "企划",
+    "统筹",
+    "特别鸣谢",
+    "出品",
+    "发行",
+    "封面",
+    "文案",
+    "吉他",
+    "贝斯",
+    "鼓",
+    "键盘",
+    "弦乐",
+    "人声编辑",
+    "program",
+    "producer",
+    "arranger",
+    "composer",
+    "lyricist",
+)
+LYRIC_PLACEHOLDER_LINES = {
+    "纯音乐请欣赏",
+    "此歌曲为没有填词的纯音乐请您欣赏",
+    "此歌曲纯音乐请您欣赏",
+    "暂无歌词",
+    "伴奏",
+}
 
 
 # --- API Wrapper ---
@@ -45,6 +98,13 @@ class NeteaseMusicAPI:
             r.raise_for_status()
             data = await r.json()
             return data["songs"][0] if data.get("songs") else None
+
+    async def get_song_lyrics(self, song_id: int) -> Dict[str, Any]:
+        """Get lyric data for a single song."""
+        url = f"{self.base_url}/lyric?id={str(song_id)}"
+        async with self.session.get(url) as r:
+            r.raise_for_status()
+            return await r.json(content_type=None)
 
     def _extract_match_audio_url(self, payload: Dict[str, Any]) -> Optional[str]:
         """
@@ -129,6 +189,10 @@ class Main(star.Star):
         self.config.setdefault("quality", "exhigh")  # 保留旧配置兼容；/song/url/match 不再使用它
         self.config.setdefault("match_source", "")   # 可选：指定匹配音源，留空表示自动匹配
         self.config.setdefault("search_limit", 5)
+        self.config.setdefault("send_detail_text", True)
+        self.config.setdefault("send_cover", True)
+        self.config.setdefault("send_audio", True)
+        self.config.setdefault("send_lyrics", False)
 
         self.waiting_users: Dict[str, Dict[str, Any]] = {}
         self.song_cache: Dict[str, List[Dict[str, Any]]] = {}
@@ -279,22 +343,30 @@ class Main(star.Star):
             if not song_details:
                 raise ValueError("无法获取歌曲详细信息。")
 
-            audio_url = await self.api.get_audio_url(
-                song_id,
-                self.config.get("match_source", "")
-            )
-            if not audio_url:
-                await event.send(
-                    MessageChain([Plain("喵~ 这首歌暂时没有匹配到可播放链接，可能需要VIP、没有版权，或匹配音源不可用呢...")])
-                )
-                return
-
             title = song_details.get("name", "")
             artists = " / ".join(a["name"] for a in song_details.get("ar", []))
             album = song_details.get("al", {}).get("name", "未知专辑")
             cover_url = song_details.get("al", {}).get("picUrl", "")
             duration_ms = song_details.get("dt", 0)
             dur_str = f"{duration_ms // 60000}:{(duration_ms % 60000) // 1000:02d}"
+            audio_url: Optional[str] = None
+            audio_notice: Optional[str] = None
+            lyrics_image_base64: Optional[str] = None
+            lyrics_notice: Optional[str] = None
+            audio_task: Optional[asyncio.Task] = None
+            lyrics_task: Optional[asyncio.Task] = None
+
+            if self._config_enabled("send_audio", True):
+                audio_task = asyncio.create_task(self._get_audio_output(song_id))
+
+            if self._config_enabled("send_lyrics", False):
+                lyrics_task = asyncio.create_task(self._get_lyrics_output(song_id, title, artists))
+
+            if audio_task:
+                audio_url, audio_notice = await audio_task
+
+            if lyrics_task:
+                lyrics_image_base64, lyrics_notice = await lyrics_task
 
             await self._send_song_messages(
                 event,
@@ -305,6 +377,9 @@ class Main(star.Star):
                 dur_str,
                 cover_url,
                 audio_url,
+                lyrics_image_base64,
+                lyrics_notice,
+                audio_notice,
             )
 
         except Exception as e:
@@ -313,6 +388,228 @@ class Main(star.Star):
         finally:
             if cache_key in self.song_cache:
                 del self.song_cache[cache_key]
+
+    def _config_enabled(self, key: str, default: bool) -> bool:
+        """Read a bool config value safely."""
+        value = self.config.get(key, default)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    async def _get_audio_output(self, song_id: int) -> Tuple[Optional[str], Optional[str]]:
+        """Fetch audio output information without interrupting other message parts."""
+        try:
+            audio_url = await self.api.get_audio_url(
+                song_id,
+                self.config.get("match_source", "")
+            )
+        except Exception as e:
+            logger.error(f"Netease Music plugin: Failed to get audio url for song {song_id}. Error: {e!s}")
+            return None, "喵~ 这首歌的播放链接获取失败了，可能是音源服务暂时不可用呢..."
+
+        if audio_url:
+            return audio_url, None
+
+        return None, "喵~ 这首歌暂时没有匹配到可播放链接，可能需要VIP、没有版权，或匹配音源不可用呢..."
+
+    async def _get_lyrics_output(self, song_id: int, title: str, artists: str) -> Tuple[Optional[str], Optional[str]]:
+        """Fetch lyrics and render them into a long image."""
+        if PILImage is None or ImageDraw is None or ImageFont is None:
+            logger.error("Netease Music plugin: Pillow is not available, cannot render lyric image.")
+            return None, "喵~ 当前环境暂时无法生成歌词图片呢，请稍后再试试吧..."
+
+        try:
+            lyric_data = await self.api.get_song_lyrics(song_id)
+        except Exception as e:
+            logger.error(f"Netease Music plugin: Failed to get lyrics for song {song_id}. Error: {e!s}")
+            return None, "喵~ 歌词接口暂时有点不稳定，没法生成歌词图片呢..."
+
+        origin_lyrics = self._clean_lyrics_text(lyric_data.get("lrc", {}).get("lyric", ""))
+        if not origin_lyrics:
+            return None, "喵~ 这首歌暂时没有可发送的歌词图片呢..."
+
+        try:
+            return self._render_lyrics_image(title, artists, origin_lyrics)
+        except Exception as e:
+            logger.error(f"Netease Music plugin: Failed to render lyric image for song {song_id}. Error: {e!s}")
+            return None, "喵~ 歌词图片渲染失败，暂时无法发送歌词图片呢..."
+
+    def _clean_lyrics_text(self, raw_lyrics: str) -> str:
+        """Remove lyric timestamps, metadata lines, and placeholder lines."""
+        cleaned_lines = []
+        for line in raw_lyrics.splitlines():
+            cleaned = re.sub(r"\[[^\]]*\]", "", line).strip()
+            cleaned = re.sub(r"\s+", " ", cleaned)
+            if cleaned and not self._is_non_lyric_line(cleaned):
+                cleaned_lines.append(cleaned)
+        return "\n".join(cleaned_lines)
+
+    def _is_non_lyric_line(self, line: str) -> bool:
+        """Detect metadata or placeholder lines that should not appear in lyric images."""
+        normalized = re.sub(r"[。！!,.，:：\s]+", "", line).strip().lower()
+        if not normalized:
+            return True
+        if normalized in LYRIC_PLACEHOLDER_LINES:
+            return True
+        return normalized.startswith(LYRIC_METADATA_PREFIXES)
+
+    def _render_lyrics_image(self, title: str, artists: str, lyrics_text: str) -> Tuple[Optional[str], Optional[str]]:
+        """Render a single long lyric image with a clean reading layout."""
+        if not LYRIC_FONT_PATH.is_file():
+            logger.error("Netease Music plugin: lyric font file is missing.")
+            return None, "喵~ 歌词图片字体资源缺失，暂时无法发送歌词图片呢..."
+
+        try:
+            title_font = ImageFont.truetype(str(LYRIC_FONT_PATH), 56)
+            subtitle_font = ImageFont.truetype(str(LYRIC_FONT_PATH), 30)
+            body_font = ImageFont.truetype(str(LYRIC_FONT_PATH), 36)
+        except Exception as e:
+            logger.error(f"Netease Music plugin: Failed to load lyric font. Error: {e!s}")
+            return None, "喵~ 歌词图片字体加载失败，暂时无法发送歌词图片呢..."
+
+        outer_padding = 40
+        card_padding_x = 84
+        card_padding_top = 72
+        card_padding_bottom = 84
+        title_spacing = 14
+        subtitle_spacing = 10
+        divider_gap_top = 28
+        divider_gap_bottom = 36
+        body_spacing = 18
+        max_text_width = LYRIC_IMAGE_WIDTH - (outer_padding * 2) - (card_padding_x * 2)
+
+        measure_canvas = PILImage.new("RGB", (LYRIC_IMAGE_WIDTH, 10), "#FFFFFF")
+        measure_draw = ImageDraw.Draw(measure_canvas)
+
+        title_lines = self._wrap_text_to_width(title, title_font, max_text_width, measure_draw)
+        artist_lines = self._wrap_text_to_width(artists, subtitle_font, max_text_width, measure_draw)
+        lyric_lines: List[str] = []
+        for paragraph in lyrics_text.splitlines():
+            lyric_lines.extend(self._wrap_text_to_width(paragraph, body_font, max_text_width, measure_draw))
+
+        if not lyric_lines:
+            return None, "喵~ 这首歌暂时没有可发送的歌词图片呢..."
+
+        title_height = self._measure_text_block_height(title_lines, self._font_line_height(title_font), title_spacing)
+        artist_height = self._measure_text_block_height(artist_lines, self._font_line_height(subtitle_font), subtitle_spacing)
+        lyric_height = self._measure_text_block_height(lyric_lines, self._font_line_height(body_font), body_spacing)
+        total_height = (
+            outer_padding * 2
+            + card_padding_top
+            + title_height
+            + artist_height
+            + divider_gap_top
+            + 1
+            + divider_gap_bottom
+            + lyric_height
+            + card_padding_bottom
+        )
+
+        if total_height > LYRIC_IMAGE_MAX_HEIGHT:
+            logger.warning(
+                f"Netease Music plugin: lyric image skipped because height {total_height} exceeds limit {LYRIC_IMAGE_MAX_HEIGHT}."
+            )
+            return None, "喵~ 这首歌的歌词太长了，单张图片会超出安全高度，暂时无法发送歌词图片呢..."
+
+        image = PILImage.new("RGB", (LYRIC_IMAGE_WIDTH, total_height), "#F4EEE6")
+        draw = ImageDraw.Draw(image)
+
+        card_box = (
+            outer_padding,
+            outer_padding,
+            LYRIC_IMAGE_WIDTH - outer_padding,
+            total_height - outer_padding,
+        )
+        draw.rounded_rectangle(card_box, radius=38, fill="#FFFDF8")
+
+        accent_top = outer_padding + 28
+        draw.rounded_rectangle(
+            (outer_padding + 52, accent_top, outer_padding + 172, accent_top + 8),
+            radius=4,
+            fill="#D4B38A",
+        )
+
+        current_y = outer_padding + card_padding_top
+        text_x = outer_padding + card_padding_x
+
+        current_y = self._draw_text_block(draw, title_lines, title_font, text_x, current_y, "#201A17", title_spacing)
+        current_y += 12
+        current_y = self._draw_text_block(draw, artist_lines, subtitle_font, text_x, current_y, "#6C625A", subtitle_spacing)
+        current_y += divider_gap_top
+
+        divider_y = current_y
+        draw.line(
+            (text_x, divider_y, LYRIC_IMAGE_WIDTH - outer_padding - card_padding_x, divider_y),
+            fill="#E4D8CB",
+            width=2,
+        )
+        current_y = divider_y + divider_gap_bottom
+
+        self._draw_text_block(draw, lyric_lines, body_font, text_x, current_y, "#2A2420", body_spacing)
+
+        image_buffer = io.BytesIO()
+        image.save(image_buffer, format="PNG", optimize=True)
+        return base64.b64encode(image_buffer.getvalue()).decode("ascii"), None
+
+    def _wrap_text_to_width(
+        self,
+        text: str,
+        font: Any,
+        max_width: int,
+        draw: Any,
+    ) -> List[str]:
+        """Wrap text to the target width using character-based measurement."""
+        content = text.strip()
+        if not content:
+            return []
+
+        wrapped_lines: List[str] = []
+        current = ""
+        for char in content:
+            if not current and char.isspace():
+                continue
+            candidate = current + char
+            if current and draw.textlength(candidate, font=font) > max_width:
+                wrapped_lines.append(current.rstrip())
+                current = char.lstrip() if char.isspace() else char
+            else:
+                current = candidate
+
+        if current.strip():
+            wrapped_lines.append(current.rstrip())
+
+        return wrapped_lines
+
+    def _font_line_height(self, font: Any) -> int:
+        """Measure font line height consistently."""
+        ascent, descent = font.getmetrics()
+        return ascent + descent
+
+    def _measure_text_block_height(self, lines: List[str], line_height: int, spacing: int) -> int:
+        """Measure total text block height including spacing."""
+        if not lines:
+            return 0
+        return len(lines) * line_height + (len(lines) - 1) * spacing
+
+    def _draw_text_block(
+        self,
+        draw: Any,
+        lines: List[str],
+        font: Any,
+        x: int,
+        y: int,
+        fill: str,
+        spacing: int,
+    ) -> int:
+        """Draw a wrapped text block and return the next y position."""
+        line_height = self._font_line_height(font)
+        current_y = y
+        for index, line in enumerate(lines):
+            draw.text((x, current_y), line, font=font, fill=fill)
+            current_y += line_height
+            if index < len(lines) - 1:
+                current_y += spacing
+        return current_y
 
     async def _send_song_messages(
         self,
@@ -323,10 +620,19 @@ class Main(star.Star):
         album: str,
         dur_str: str,
         cover_url: str,
-        audio_url: str,
+        audio_url: Optional[str],
+        lyrics_image_base64: Optional[str],
+        lyrics_notice: Optional[str],
+        audio_notice: Optional[str],
     ):
-        """Constructs and sends the song info and audio messages."""
+        """Constructs and sends configured song messages."""
         source_text = self.config.get("match_source", "").strip() or "自动匹配"
+        send_detail_text = self._config_enabled("send_detail_text", True)
+        send_cover = self._config_enabled("send_cover", True)
+        send_audio = self._config_enabled("send_audio", True)
+        send_lyrics = self._config_enabled("send_lyrics", False)
+        enabled_outputs = [send_detail_text, send_cover, send_audio, send_lyrics]
+        sent_anything = False
 
         detail_text = f"""遵命，主人！为您播放第 {num} 首歌曲~
 
@@ -338,11 +644,41 @@ class Main(star.Star):
 
 请主人享用喵~
 """
-        info_components = [Plain(detail_text)]
+        info_components = []
+        if send_detail_text:
+            info_components.append(Plain(detail_text))
 
-        image_data = await self.api.download_image(cover_url)
-        if image_data:
-            info_components.append(Image.fromBase64(base64.b64encode(image_data).decode()))
+        if send_cover:
+            image_data = await self.api.download_image(cover_url)
+            if image_data:
+                info_components.append(Image.fromBase64(base64.b64encode(image_data).decode()))
 
-        await event.send(MessageChain(info_components))
-        await event.send(MessageChain([Record(file=audio_url)]))
+        if info_components:
+            await event.send(MessageChain(info_components))
+            sent_anything = True
+
+        if send_lyrics:
+            if lyrics_image_base64:
+                await event.send(MessageChain([Image.fromBase64(lyrics_image_base64)]))
+                sent_anything = True
+            elif lyrics_notice:
+                await event.send(MessageChain([Plain(lyrics_notice)]))
+                sent_anything = True
+
+        if send_audio:
+            if audio_url:
+                await event.send(MessageChain([Record(file=audio_url)]))
+                sent_anything = True
+            elif audio_notice:
+                await event.send(MessageChain([Plain(audio_notice)]))
+                sent_anything = True
+
+        if not sent_anything:
+            if any(enabled_outputs):
+                await event.send(
+                    MessageChain([Plain("喵~ 已拿到歌曲信息，但当前没有可发送的内容，可能是封面、歌词或音频资源暂时不可用呢...")])
+                )
+            else:
+                await event.send(
+                    MessageChain([Plain("当前插件配置已关闭文字介绍、封面图、歌词和音频发送，请先在 WebUI 中开启至少一项喵~")])
+                )

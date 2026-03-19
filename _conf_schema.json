@@ -8,7 +8,7 @@
   "quality": {
     "type": "string",
     "label": "默认音质",
-    "description": "优先获取的音质。如果不可用，插件会自动尝试更低的音质。",
+    "description": "保留兼容字段，当前 /song/url/match 模式下暂未实际使用。",
     "default": "exhigh",
     "options": [
       "lossless",
@@ -17,10 +17,40 @@
       "standard"
     ]
   },
+  "match_source": {
+    "type": "string",
+    "label": "匹配音源",
+    "description": "调用 /song/url/match 时传入的 source 参数。留空表示自动匹配。",
+    "default": ""
+  },
   "search_limit": {
     "type": "int",
     "label": "搜索结果数量",
     "description": "每次搜索时，向用户展示的歌曲选项数量。",
     "default": 5
+  },
+  "send_detail_text": {
+    "type": "bool",
+    "label": "发送歌曲介绍",
+    "description": "播放时是否发送歌名、歌手、专辑、时长等文字介绍。",
+    "default": true
+  },
+  "send_cover": {
+    "type": "bool",
+    "label": "发送封面图",
+    "description": "播放时是否发送歌曲封面图片。",
+    "default": true
+  },
+  "send_audio": {
+    "type": "bool",
+    "label": "发送音频",
+    "description": "播放时是否发送 Record 音频消息。",
+    "default": true
+  },
+  "send_lyrics": {
+    "type": "bool",
+    "label": "发送歌词图片",
+    "description": "播放时是否额外发送原歌词长图；不会回退为纯文本歌词。",
+    "default": false
   }
 }
